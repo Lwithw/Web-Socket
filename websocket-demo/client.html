@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chat Test Client (Full)</title>
+  <style>
+    body { font-family: sans-serif; margin: 16px; background: #f7f7f7; }
+    .row { display: flex; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+    label { min-width: 110px; display: inline-block; }
+    input, select { padding: 6px; font-size: 14px; }
+    button { padding: 6px 10px; }
+    textarea { width: 100%; height: 90px; padding: 6px; font-size: 14px; }
+    #log { height: 340px; overflow: auto; border: 1px solid #ccc; background: #fff; padding: 8px; margin-top: 12px; }
+    .msg { margin: 4px 0; }
+    .msg.system { color: #666; font-style: italic; }
+    .msg.error { color: #c00; }
+    fieldset { border: 1px solid #ccc; padding: 10px; margin-bottom: 10px; }
+    legend { padding: 0 4px; }
+  </style>
+</head>
+<body>
+  <h2>Chat Test Client</h2>
+
+  <fieldset>
+    <legend>Auth (HTTP)</legend>
+    <div class="row">
+      <label>API Base</label><input id="apiBase" value="http://localhost:3000" style="width:220px" />
+      <label>User ID</label><input id="userId" value="user123" />
+      <label>Username</label><input id="username" value="Alice" />
+      <button id="loginBtn">Login (get JWT)</button>
+    </div>
+    <div class="row">
+      <label>Token</label><input id="token" style="width:520px" />
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>WebSocket</legend>
+    <div class="row">
+      <label>WS URL</label><input id="wsUrl" value="ws://localhost:3000/chat" style="width:320px" />
+      <button id="connectBtn">Connect</button>
+      <button id="disconnectBtn" disabled>Disconnect</button>
+    </div>
+    <div class="row">
+      <label>Room</label><input id="room" value="general" />
+      <button id="joinBtn" disabled>Join</button>
+      <button id="leaveBtn" disabled>Leave</button>
+      <button id="getRoomsBtn" disabled>Get Rooms</button>
+      <button id="getUsersBtn" disabled>Get Users</button>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Messaging (Recommended: Rooms for group chat, DM for 1:1; Group-send is optional)</legend>
+    <div class="row">
+      <label>Recipient (DM)</label><input id="recipientId" placeholder="for DM" />
+      <label>Group Recipients</label><input id="groupRecipients" placeholder="u1,u2,u3" style="width:180px" />
+      <label>Group Name</label><input id="groupName" value="team" />
+    </div>
+    <div>
+      <label>Message</label>
+      <textarea id="message"></textarea>
+    </div>
+    <div class="row">
+      <button id="sendBtn" disabled>Send to Room</button>
+      <button id="dmBtn" disabled>Send DM</button>
+      <button id="groupBtn" disabled>Send Group</button>
+      <button id="typingBtn" disabled>Typing</button>
+    </div>
+    <div class="row">
+      <label>Message ID</label><input id="messageId" style="width:120px" />
+      <label>Room (pin)</label><input id="pinRoom" value="general" style="width:120px" />
+      <button id="seenBtn" disabled>Mark Seen</button>
+      <button id="starBtn" disabled>Star/Unstar</button>
+      <button id="pinBtn" disabled>Pin/Unpin</button>
+    </div>
+  </fieldset>
+
+  <div id="log"></div>
+
+  <script>
+    const qs = (id) => document.getElementById(id);
+    const apiBaseEl = qs("apiBase");
+    const tokenEl = qs("token");
+    const wsUrlEl = qs("wsUrl");
+    const userIdEl = qs("userId");
+    const usernameEl = qs("username");
+    const roomEl = qs("room");
+    const messageEl = qs("message");
+    const recipientIdEl = qs("recipientId");
+    const groupRecipientsEl = qs("groupRecipients");
+    const groupNameEl = qs("groupName");
+    const messageIdEl = qs("messageId");
+    const pinRoomEl = qs("pinRoom");
+    const logEl = qs("log");
+
+    const btn = {
+      login: qs("loginBtn"),
+      connect: qs("connectBtn"),
+      disconnect: qs("disconnectBtn"),
+      join: qs("joinBtn"),
+      leave: qs("leaveBtn"),
+      send: qs("sendBtn"),
+      dm: qs("dmBtn"),
+      group: qs("groupBtn"),
+      typing: qs("typingBtn"),
+      seen: qs("seenBtn"),
+      star: qs("starBtn"),
+      pin: qs("pinBtn"),
+      getRooms: qs("getRoomsBtn"),
+      getUsers: qs("getUsersBtn"),
+    };
+
+    let ws = null;
+    let connected = false;
+    let joined = false;
+    let typingOn = false;
+
+    function log(msg, type = "system") {
+      const div = document.createElement("div");
+      div.className = `msg ${type}`;
+      div.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      logEl.appendChild(div);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function setState() {
+      btn.connect.disabled = connected;
+      btn.disconnect.disabled = !connected;
+      btn.join.disabled = !connected || joined;
+      btn.leave.disabled = !joined;
+      btn.send.disabled = !joined;
+      btn.dm.disabled = !joined;
+      btn.group.disabled = !joined;
+      btn.typing.disabled = !joined;
+      btn.seen.disabled = !joined;
+      btn.star.disabled = !joined;
+      btn.pin.disabled = !joined;
+      btn.getRooms.disabled = !connected;
+      btn.getUsers.disabled = !joined;
+    }
+
+    btn.login.onclick = async () => {
+      try {
+        const res = await fetch(`${apiBaseEl.value}/auth/login`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            userId: userIdEl.value.trim(),
+            username: usernameEl.value.trim(),
+          }),
+        });
+        const data = await res.json();
+        if (data.token) {
+          tokenEl.value = data.token;
+          log("JWT acquired", "msg");
+        } else {
+          log("Login failed: " + JSON.stringify(data), "error");
+        }
+      } catch (e) {
+        log("Login error: " + e, "error");
+      }
+    };
+
+    btn.connect.onclick = () => {
+      if (ws) ws.close();
+      const token = tokenEl.value.trim();
+      const url = token ? `${wsUrlEl.value.trim()}?token=${encodeURIComponent(token)}` : wsUrlEl.value.trim();
+      ws = new WebSocket(url);
+
+      ws.onopen = () => {
+        connected = true;
+        setState();
+        log("WebSocket connected");
+      };
+
+      ws.onmessage = (evt) => {
+        log(`recv: ${evt.data}`, "msg");
+      };
+
+      ws.onclose = () => {
+        connected = false;
+        joined = false;
+        setState();
+        log("WebSocket closed");
+      };
+
+      ws.onerror = (err) => {
+        log("WebSocket error: " + err, "error");
+      };
+    };
+
+    btn.disconnect.onclick = () => ws && ws.close();
+
+    btn.join.onclick = () => {
+      if (!ws) return;
+      ws.send(JSON.stringify({
+        type: "join",
+        username: usernameEl.value.trim() || "Anonymous",
+        room: roomEl.value.trim() || "general",
+        userId: userIdEl.value.trim() || `user-${Date.now()}`,
+      }));
+      joined = true;
+      setState();
+      log("sent join");
+    };
+
+    btn.leave.onclick = () => {
+      if (!ws) return;
+      ws.send(JSON.stringify({ type: "leave", room: roomEl.value.trim() || "general" }));
+      joined = false;
+      setState();
+      log("sent leave");
+    };
+
+    btn.send.onclick = () => {
+      if (!ws) return;
+      ws.send(JSON.stringify({
+        type: "message",
+        room: roomEl.value.trim() || "general",
+        content: messageEl.value.trim(),
+      }));
+      log("sent message");
+    };
+
+    btn.dm.onclick = () => {
+      if (!ws) return;
+      ws.send(JSON.stringify({
+        type: "dm",
+        recipientId: recipientIdEl.value.trim(),
+        content: messageEl.value.trim(),
+      }));
+      log("sent dm");
+    };
+
+    btn.group.onclick = () => {
+      if (!ws) return;
+      const ids = groupRecipientsEl.value.split(",").map(s => s.trim()).filter(Boolean);
+      ws.send(JSON.stringify({
+        type: "group_message",
+        recipientIds: ids,
+        content: messageEl.value.trim(),
+        groupName: groupNameEl.value.trim() || "group",
+      }));
+      log("sent group_message");
+    };
+
+    btn.typing.onclick = () => {
+      if (!ws) return;
+      typingOn = !typingOn;
+      ws.send(JSON.stringify({
+        type: "typing",
+        room: roomEl.value.trim() || "general",
+        isTyping: typingOn,
+      }));
+      log(`typing ${typingOn ? "on" : "off"}`);
+    };
+
+    btn.seen.onclick = () => {
+      if (!ws) return;
+      ws.send(JSON.stringify({
+        type: "message_seen",
+        messageId: Number(messageIdEl.value) || 0,
+      }));
+      log("sent message_seen");
+    };
+
+    btn.star.onclick = () => {
+      if (!ws) return;
+      ws.send(JSON.stringify({
+        type: "star_message",
+        messageId: Number(messageIdEl.value) || 0,
+      }));
+      log("sent star_message");
+    };
+
+    btn.pin.onclick = () => {
+      if (!ws) return;
+      ws.send(JSON.stringify({
+        type: "pin_message",
+        messageId: Number(messageIdEl.value) || 0,
+        roomName: pinRoomEl.value.trim() || "general",
+      }));
+      log("sent pin_message");
+    };
+
+    btn.getRooms.onclick = () => {
+      if (!ws) return;
+      ws.send(JSON.stringify({ type: "get_rooms" }));
+      log("sent get_rooms");
+    };
+
+    btn.getUsers.onclick = () => {
+      if (!ws) return;
+      ws.send(JSON.stringify({ type: "get_users", room: roomEl.value.trim() || "general" }));
+      log("sent get_users");
+    };
+
+    setState();
+  </script>
+</body>
+</html>
+
