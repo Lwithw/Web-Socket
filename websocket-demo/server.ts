@@ -1,24 +1,29 @@
 /// <reference types="bun-types" />
-import type { WebSocket } from "bun";
+import type { ServerWebSocket } from "bun";
 import { db } from "./db";
 import { messageQueue, initMessageQueue } from "./rabbitmq";
-
-type MsgRow = { id: number; username: string; content: string; created_at: string };
+import { mediaHandler, type MediaFile } from "./media";
+import { signalManager, sessionManager } from "./encryption";
+import { userManager } from "./users";
+import { messageManager } from "./messages";
+import { authenticateRequest, authenticateWebSocket, generateToken } from "./auth";
+import { rateLimitMiddleware, rateLimitWebSocket } from "./rate-limit";
+import { getSecurityHeaders, sanitizeInput, isValidUserId, isValidRoomName, isValidUsername, handleCorsPreflight, getSslOptions } from "./security";
 
 // Room-based pub/sub system
 type Room = {
   name: string;
-  clients: Set<WebSocket>;
+  clients: Set<ServerWebSocket>;
 };
 
 const rooms = new Map<string, Room>();
-const clientRooms = new WeakMap<WebSocket, Set<string>>(); // Track which rooms each client is in
-const clientData = new WeakMap<WebSocket, { username: string; userId: string }>(); // Track client metadata
-const userIdToSocket = new Map<string, WebSocket>(); // userId -> WebSocket for DMs
-let useRabbitMQ = false; // Flag to check if RabbitMQ is available
+const clientRooms = new WeakMap<ServerWebSocket, Set<string>>();
+const clientData = new WeakMap<ServerWebSocket, { username: string; userId: string }>();
+const userIdToSocket = new Map<string, ServerWebSocket>();
+let useRabbitMQ = false;
 
 // Room management
-function joinRoom(ws: WebSocket, roomName: string, username: string) {
+function joinRoom(ws: ServerWebSocket, roomName: string, username: string) {
   if (!rooms.has(roomName)) {
     rooms.set(roomName, { name: roomName, clients: new Set() });
     console.log(`🏠 Created new room: ${roomName}`);
@@ -34,7 +39,6 @@ function joinRoom(ws: WebSocket, roomName: string, username: string) {
 
   console.log(`👤 ${username} joined room: ${roomName} (${room.clients.size} users)`);
 
-  // Notify room members
   broadcastToRoom(roomName, {
     type: "user_joined",
     username,
@@ -46,7 +50,7 @@ function joinRoom(ws: WebSocket, roomName: string, username: string) {
   return room;
 }
 
-function leaveRoom(ws: WebSocket, roomName: string) {
+function leaveRoom(ws: ServerWebSocket, roomName: string) {
   const room = rooms.get(roomName);
   if (!room) return;
 
@@ -72,7 +76,7 @@ function leaveRoom(ws: WebSocket, roomName: string) {
   }
 }
 
-function broadcastToRoom(roomName: string, data: any, exclude?: WebSocket) {
+function broadcastToRoom(roomName: string, data: any, exclude?: ServerWebSocket) {
   const room = rooms.get(roomName);
   if (!room) return;
 
@@ -90,69 +94,6 @@ function broadcastToRoom(roomName: string, data: any, exclude?: WebSocket) {
   }
 
   console.log(`📡 Broadcast to room ${roomName}: ${sent}/${room.clients.size} clients`);
-}
-
-// Database functions
-async function getMessages(roomName: string = "general", limit: number = 50): Promise<MsgRow[]> {
-  try {
-    const res = await db.query(
-      "SELECT id, username, content, created_at FROM messages WHERE room_name = $1 ORDER BY id DESC LIMIT $2",
-      [roomName, limit]
-    );
-    console.log(`✅ Retrieved ${res.rows.length} messages from room: ${roomName}`);
-    return res.rows.reverse();
-  } catch (err) {
-    console.error("❌ DB Error fetching messages:", err);
-    return [];
-  }
-}
-
-async function getPendingDMs(userId: string): Promise<any[]> {
-  try {
-    const res = await db.query(
-      `SELECT id, username, content, message_type, recipient_id, created_at 
-       FROM messages 
-       WHERE message_type = 'dm' 
-       AND recipient_id = $1 
-       AND delivered = false 
-       ORDER BY created_at ASC`,
-      [userId]
-    );
-    console.log(`✅ Retrieved ${res.rows.length} pending DMs for user: ${userId}`);
-    return res.rows;
-  } catch (err) {
-    console.error("❌ DB Error fetching pending DMs:", err);
-    return [];
-  }
-}
-
-async function markDMsAsDelivered(messageIds: number[]) {
-  try {
-    await db.query(
-      "UPDATE messages SET delivered = true WHERE id = ANY($1)",
-      [messageIds]
-    );
-    console.log(`✅ Marked ${messageIds.length} DMs as delivered`);
-  } catch (err) {
-    console.error("❌ DB Error marking DMs as delivered:", err);
-  }
-}
-
-async function saveMessage(username: string, content: string, roomName: string = "general", messageType: string = "room", recipientId?: string) {
-  console.log(`💾 Saving: user="${username}", type="${messageType}", room="${roomName}", content="${content}"`);
-  
-  try {
-    const result = await db.query(
-      "INSERT INTO messages (username, content, room_name, message_type, recipient_id, delivered) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, username, content, room_name, message_type, recipient_id, delivered, created_at",
-      [username, content, roomName, messageType, recipientId || null, messageType === 'room' ? true : false]
-    );
-    
-    console.log(`✅ Message saved:`, result.rows[0]);
-    return result.rows[0];
-  } catch (err) {
-    console.error("❌ DB Error saving message:", err);
-    throw err;
-  }
 }
 
 async function getOnlineUsers(roomName: string): Promise<string[]> {
@@ -177,7 +118,7 @@ async function getRoomList(): Promise<{ name: string; userCount: number }[]> {
 }
 
 // Typing indicators
-const typingUsers = new Map<string, Set<string>>(); // roomName -> Set<username>
+const typingUsers = new Map<string, Set<string>>();
 
 function setTyping(roomName: string, username: string, isTyping: boolean) {
   if (!typingUsers.has(roomName)) {
@@ -199,76 +140,16 @@ function setTyping(roomName: string, username: string, isTyping: boolean) {
   });
 }
 
-// Test database and create schema
+// Test database and create enhanced schema
 async function testDatabase() {
   try {
     await db.query("SELECT 1");
     console.log("✅ Database connection successful");
     
-    const tableCheck = await db.query(`
-      SELECT EXISTS (
-        SELECT FROM information_schema.tables 
-        WHERE table_name = 'messages'
-      );
-    `);
-    
-    if (!tableCheck.rows[0].exists) {
-      console.log("Creating messages table with room support...");
-      
-      await db.query(`
-        CREATE TABLE IF NOT EXISTS messages (
-          id SERIAL PRIMARY KEY,
-          username VARCHAR(255) NOT NULL DEFAULT 'Anonymous',
-          content TEXT NOT NULL,
-          room_name VARCHAR(255) NOT NULL DEFAULT 'general',
-          message_type VARCHAR(50) NOT NULL DEFAULT 'room',
-          recipient_id VARCHAR(255),
-          delivered BOOLEAN DEFAULT false,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          edited_at TIMESTAMP,
-          deleted_at TIMESTAMP
-        );
-        
-        CREATE INDEX IF NOT EXISTS idx_messages_room ON messages(room_name, created_at);
-        CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient_id, created_at);
-        CREATE INDEX IF NOT EXISTS idx_messages_type ON messages(message_type);
-        CREATE INDEX IF NOT EXISTS idx_messages_delivered ON messages(recipient_id, delivered) WHERE delivered = false;
-      `);
-      
-      console.log("✅ Messages table created with indexes");
-    } else {
-      // Check if room_name column exists, add if not
-      const columnCheck = await db.query(`
-        SELECT column_name 
-        FROM information_schema.columns 
-        WHERE table_name = 'messages' AND column_name IN ('room_name', 'delivered');
-      `);
-
-      const existingColumns = columnCheck.rows.map(r => r.column_name);
-
-      if (!existingColumns.includes('room_name')) {
-        console.log("Adding room_name column...");
-        await db.query(`
-          ALTER TABLE messages ADD COLUMN room_name VARCHAR(255) NOT NULL DEFAULT 'general';
-          CREATE INDEX idx_messages_room ON messages(room_name, created_at);
-        `);
-        console.log("✅ Added room support to existing table");
-      }
-
-      if (!existingColumns.includes('delivered')) {
-        console.log("Adding delivered column for offline messages...");
-        await db.query(`
-          ALTER TABLE messages ADD COLUMN delivered BOOLEAN DEFAULT false;
-          CREATE INDEX idx_messages_delivered ON messages(recipient_id, delivered) WHERE delivered = false;
-        `);
-        console.log("✅ Added offline message support");
-      }
-
-      if (existingColumns.includes('room_name') && existingColumns.includes('delivered')) {
-        console.log("✅ Messages table exists with room and offline message support");
-      }
-    }
+    // Run schema.sql to create all tables
+    const schemaFile = await Bun.file("schema.sql").text();
+    await db.query(schemaFile);
+    console.log("✅ Database schema initialized");
     
   } catch (err) {
     console.error("❌ Database test failed:", err);
@@ -277,90 +158,180 @@ async function testDatabase() {
 }
 
 const server = Bun.serve({
-  port: 3000,
+  port: parseInt(process.env.PORT || "3000"),
+  hostname: process.env.HOST || "0.0.0.0",
+  ...(getSslOptions() || {}),
 
   async fetch(req, server) {
     const url = new URL(req.url);
 
-    // WebSocket upgrade at /chat
+    // Handle CORS preflight
+    const corsResponse = handleCorsPreflight(req);
+    if (corsResponse) return corsResponse;
+
+    // Apply rate limiting
+    const rateLimit = rateLimitMiddleware(req);
+    if (!rateLimit.allowed) {
+      return new Response(
+        JSON.stringify({ success: false, error: "Rate limit exceeded" }),
+        {
+          status: 429,
+          headers: {
+            "Content-Type": "application/json",
+            "X-RateLimit-Remaining": rateLimit.remaining.toString(),
+            "X-RateLimit-Reset": rateLimit.resetAt.toString(),
+            ...getSecurityHeaders(),
+          },
+        }
+      );
+    }
+
+    // WebSocket upgrade
     if (url.pathname === "/chat") {
-      if (server.upgrade(req)) return;
+      // Optional: Authenticate WebSocket upgrade
+      const token = url.searchParams.get("token");
+      if (token) {
+        const user = authenticateWebSocket(token);
+        if (!user) {
+          return new Response("Unauthorized", { status: 401 });
+        }
+      }
+      
+      if (server.upgrade(req, { data: { token } })) return;
       return new Response("WebSocket upgrade failed", { status: 500 });
     }
 
-    // REST API Endpoints
-
-    // GET /rooms - List all active rooms
-    if (url.pathname === "/rooms" && req.method === "GET") {
+    // Authentication endpoint (for getting JWT token)
+    if (url.pathname === "/auth/login" && req.method === "POST") {
       try {
-        const roomList = await getRoomList();
-        return new Response(JSON.stringify({ success: true, rooms: roomList }), {
-          headers: { "Content-Type": "application/json" }
-        });
-      } catch (err) {
-        return new Response(
-          JSON.stringify({ success: false, error: String(err) }),
-          { status: 500, headers: { "Content-Type": "application/json" } }
-        );
-      }
-    }
-
-    // GET /messages?room=roomName - Get messages for a room
-    if (url.pathname === "/messages" && req.method === "GET") {
-      try {
-        const roomName = url.searchParams.get("room") || "general";
-        const limit = parseInt(url.searchParams.get("limit") || "50");
-        const msgs = await getMessages(roomName, limit);
-        return new Response(JSON.stringify({ success: true, room: roomName, messages: msgs }), {
-          headers: { "Content-Type": "application/json" }
-        });
-      } catch (err) {
-        return new Response(
-          JSON.stringify({ success: false, error: String(err) }),
-          { status: 500, headers: { "Content-Type": "application/json" } }
-        );
-      }
-    }
-
-    // POST /message - Send message to room
-    if (url.pathname === "/message" && req.method === "POST") {
-      try {
-        const body = await req.json();
-        console.log("📨 POST BODY:", body);
+        const body = await req.json() as { userId: string; username: string };
         
-        const username = String(body.username || "Anonymous");
-        const content = String(body.content || "").trim();
-        const roomName = String(body.room || "general");
-        
-        if (!content) {
+        if (!body.userId || !body.username) {
           return new Response(
-            JSON.stringify({ success: false, error: "content required" }),
-            { status: 400, headers: { "Content-Type": "application/json" } }
+            JSON.stringify({ success: false, error: "userId and username required" }),
+            { status: 400, headers: { "Content-Type": "application/json", ...getSecurityHeaders() } }
           );
         }
 
-        const savedMsg = await saveMessage(username, content, roomName);
+        if (!isValidUserId(body.userId) || !isValidUsername(body.username)) {
+          return new Response(
+            JSON.stringify({ success: false, error: "Invalid userId or username format" }),
+            { status: 400, headers: { "Content-Type": "application/json", ...getSecurityHeaders() } }
+          );
+        }
 
-        // Broadcast to room subscribers
-        broadcastToRoom(roomName, {
-          type: "message",
-          ...savedMsg
-        });
-
+        const token = generateToken(body.userId, sanitizeInput(body.username));
         return new Response(
-          JSON.stringify({ success: true, message: savedMsg }),
-          { headers: { "Content-Type": "application/json" } }
+          JSON.stringify({ success: true, token, userId: body.userId, username: body.username }),
+          { headers: { "Content-Type": "application/json", ...getSecurityHeaders() } }
         );
       } catch (err) {
-        console.error("❌ POST /message error:", err);
         return new Response(
           JSON.stringify({ success: false, error: String(err) }),
-          { status: 500, headers: { "Content-Type": "application/json" } }
+          { status: 500, headers: { "Content-Type": "application/json", ...getSecurityHeaders() } }
         );
       }
     }
 
-    // GET /users?room=roomName - Get online users in a room
+    // Media upload endpoint
+    if (url.pathname === "/upload" && req.method === "POST") {
+      // Authenticate request
+      const user = authenticateRequest(req);
+      if (!user) {
+        return new Response(
+          JSON.stringify({ success: false, error: "Unauthorized" }),
+          { status: 401, headers: { "Content-Type": "application/json", ...getSecurityHeaders() } }
+        );
+      }
+
+      try {
+        const formData = await req.formData();
+        const file = formData.get("file") as File;
+        const userId = user.userId; // Use authenticated user ID
+        const messageType = (formData.get("messageType") as string) || "image";
+
+        if (!file) {
+          return new Response(
+            JSON.stringify({ success: false, error: "file required" }),
+            { status: 400, headers: { "Content-Type": "application/json", ...getSecurityHeaders() } }
+          );
+        }
+
+        const buffer = Buffer.from(await file.arrayBuffer());
+        const mediaFile = await mediaHandler.saveFile(buffer, file.type, messageType as any, file.name);
+        
+        return new Response(
+          JSON.stringify({ success: true, media: mediaFile }),
+          { headers: { "Content-Type": "application/json", ...getSecurityHeaders() } }
+        );
+      } catch (err) {
+        console.error("❌ Upload error:", err);
+        return new Response(
+          JSON.stringify({ success: false, error: String(err) }),
+          { status: 500, headers: { "Content-Type": "application/json", ...getSecurityHeaders() } }
+        );
+      }
+    }
+
+    // Serve uploaded media
+    if (url.pathname.startsWith("/media/")) {
+      const filename = url.pathname.split("/media/")[1];
+      try {
+        const file = Bun.file(`uploads/${filename}`);
+        if (await file.exists()) {
+          return new Response(file);
+        }
+        return new Response("File not found", { status: 404 });
+      } catch (err) {
+        return new Response("Error serving file", { status: 500 });
+      }
+    }
+
+    // REST API Endpoints
+    if (url.pathname === "/rooms" && req.method === "GET") {
+      // Optional: Require authentication
+      // const user = authenticateRequest(req);
+      // if (!user) {
+      //   return new Response(JSON.stringify({ success: false, error: "Unauthorized" }), {
+      //     status: 401, headers: { "Content-Type": "application/json", ...getSecurityHeaders() }
+      //   });
+      // }
+
+      try {
+        const roomList = await getRoomList();
+        return new Response(JSON.stringify({ success: true, rooms: roomList }), {
+          headers: { "Content-Type": "application/json", ...getSecurityHeaders() }
+        });
+      } catch (err) {
+        return new Response(
+          JSON.stringify({ success: false, error: String(err) }),
+          { status: 500, headers: { "Content-Type": "application/json", ...getSecurityHeaders() } }
+        );
+      }
+    }
+
+    if (url.pathname === "/messages" && req.method === "GET") {
+      try {
+        const roomName = url.searchParams.get("room") || "general";
+        if (!isValidRoomName(roomName)) {
+          return new Response(
+            JSON.stringify({ success: false, error: "Invalid room name" }),
+            { status: 400, headers: { "Content-Type": "application/json", ...getSecurityHeaders() } }
+          );
+        }
+        const limit = Math.min(parseInt(url.searchParams.get("limit") || "50"), 100); // Max 100
+        const msgs = await messageManager.getMessages({ roomName, limit });
+        return new Response(JSON.stringify({ success: true, room: roomName, messages: msgs }), {
+          headers: { "Content-Type": "application/json", ...getSecurityHeaders() }
+        });
+      } catch (err) {
+        return new Response(
+          JSON.stringify({ success: false, error: String(err) }),
+          { status: 500, headers: { "Content-Type": "application/json", ...getSecurityHeaders() } }
+        );
+      }
+    }
+
     if (url.pathname === "/users" && req.method === "GET") {
       try {
         const roomName = url.searchParams.get("room") || "general";
@@ -377,42 +348,171 @@ const server = Bun.serve({
       }
     }
 
-    return new Response("Bun Chat Server with Pub/Sub. WebSocket: /chat", { status: 200 });
+    // Search messages
+    if (url.pathname === "/search" && req.method === "GET") {
+      try {
+        const query = url.searchParams.get("q") || "";
+        const userId = url.searchParams.get("userId") || "";
+        const results = await messageManager.searchMessages(userId, query);
+        return new Response(
+          JSON.stringify({ success: true, results }),
+          { headers: { "Content-Type": "application/json" } }
+        );
+      } catch (err) {
+        return new Response(
+          JSON.stringify({ success: false, error: String(err) }),
+          { status: 500, headers: { "Content-Type": "application/json" } }
+        );
+      }
+    }
+
+    // Block user
+    if (url.pathname === "/block" && req.method === "POST") {
+      const user = authenticateRequest(req);
+      if (!user) {
+        return new Response(
+          JSON.stringify({ success: false, error: "Unauthorized" }),
+          { status: 401, headers: { "Content-Type": "application/json", ...getSecurityHeaders() } }
+        );
+      }
+
+      try {
+        const body = await req.json() as { blockedUserId: string };
+        if (!body.blockedUserId || !isValidUserId(body.blockedUserId)) {
+          return new Response(
+            JSON.stringify({ success: false, error: "Invalid blockedUserId" }),
+            { status: 400, headers: { "Content-Type": "application/json", ...getSecurityHeaders() } }
+          );
+        }
+        await userManager.blockUser(user.userId, body.blockedUserId);
+        return new Response(
+          JSON.stringify({ success: true }),
+          { headers: { "Content-Type": "application/json", ...getSecurityHeaders() } }
+        );
+      } catch (err) {
+        return new Response(
+          JSON.stringify({ success: false, error: String(err) }),
+          { status: 500, headers: { "Content-Type": "application/json", ...getSecurityHeaders() } }
+        );
+      }
+    }
+
+    // Report user
+    if (url.pathname === "/report" && req.method === "POST") {
+      const user = authenticateRequest(req);
+      if (!user) {
+        return new Response(
+          JSON.stringify({ success: false, error: "Unauthorized" }),
+          { status: 401, headers: { "Content-Type": "application/json", ...getSecurityHeaders() } }
+        );
+      }
+
+      try {
+        const body = await req.json() as { reportedUserId: string; reason: string };
+        if (!body.reportedUserId || !isValidUserId(body.reportedUserId)) {
+          return new Response(
+            JSON.stringify({ success: false, error: "Invalid reportedUserId" }),
+            { status: 400, headers: { "Content-Type": "application/json", ...getSecurityHeaders() } }
+          );
+        }
+        const reason = sanitizeInput(body.reason || "", 500);
+        if (!reason) {
+          return new Response(
+            JSON.stringify({ success: false, error: "Reason required" }),
+            { status: 400, headers: { "Content-Type": "application/json", ...getSecurityHeaders() } }
+          );
+        }
+        await userManager.reportUser(user.userId, body.reportedUserId, reason);
+        return new Response(
+          JSON.stringify({ success: true }),
+          { headers: { "Content-Type": "application/json", ...getSecurityHeaders() } }
+        );
+      } catch (err) {
+        return new Response(
+          JSON.stringify({ success: false, error: String(err) }),
+          { status: 500, headers: { "Content-Type": "application/json", ...getSecurityHeaders() } }
+        );
+      }
+    }
+
+    return new Response("Enhanced Chat Server", { 
+      status: 200,
+      headers: getSecurityHeaders()
+    });
   },
 
   websocket: {
     async open(ws) {
       console.log("🔌 New WebSocket connection");
+      
+      // Optional: Authenticate WebSocket on open
+      const token = ws.data?.token;
+      if (token) {
+        const user = authenticateWebSocket(token);
+        if (user) {
+          // Store user data in WebSocket
+          (ws as any).userData = user;
+        }
+      }
     },
 
     async message(ws, msg) {
+      // Apply rate limiting
+      const userData = (ws as any).userData;
+      const identifier = userData ? `user:${userData.userId}` : `ws:${ws.remoteAddress}`;
+      const rateLimit = rateLimitWebSocket(identifier);
+      
+      if (!rateLimit.allowed) {
+        ws.send(JSON.stringify({
+          type: "error",
+          message: "Rate limit exceeded",
+          remaining: rateLimit.remaining,
+          resetAt: rateLimit.resetAt
+        }));
+        return;
+      }
+
       let data;
       try { 
         data = JSON.parse(msg.toString()); 
       } catch { 
         console.warn("⚠️ Invalid JSON");
+        ws.send(JSON.stringify({ type: "error", message: "Invalid JSON" }));
         return; 
       }
 
       console.log("📩 WS message:", data.type);
 
-      // JOIN - Subscribe to a room
+      // JOIN
       if (data.type === "join") {
-        const username = String(data.username || "Anonymous");
-        const roomName = String(data.room || "general");
+        const username = sanitizeInput(String(data.username || "Anonymous"), 50);
+        const roomName = sanitizeInput(String(data.room || "general"), 100);
         const userId = String(data.userId || Date.now());
 
+        // Validate inputs
+        if (!isValidUsername(username)) {
+          ws.send(JSON.stringify({ type: "error", message: "Invalid username format" }));
+          return;
+        }
+        if (!isValidRoomName(roomName)) {
+          ws.send(JSON.stringify({ type: "error", message: "Invalid room name format" }));
+          return;
+        }
+        if (!isValidUserId(userId)) {
+          ws.send(JSON.stringify({ type: "error", message: "Invalid userId format" }));
+          return;
+        }
+
         clientData.set(ws, { username, userId });
-        userIdToSocket.set(userId, ws); // Register for DMs
+        userIdToSocket.set(userId, ws);
         joinRoom(ws, roomName, username);
 
-        // Send room history
         try {
-          const history = await getMessages(roomName);
+          const history = await messageManager.getMessages({ roomName, limit: 50 });
           const users = await getOnlineUsers(roomName);
-          
-          // Get pending DMs (offline messages)
-          const pendingDMs = await getPendingDMs(userId);
+          // Get undelivered messages for this user
+          const allPending = await messageManager.getMessages({ recipientId: userId, limit: 100 });
+          const pendingDMs = allPending.filter(m => !m.delivered);
           
           ws.send(JSON.stringify({ 
             type: "joined", 
@@ -424,50 +524,62 @@ const server = Bun.serve({
             timestamp: new Date().toISOString()
           }));
 
-          // Deliver pending DMs
+          // Deliver pending messages
           if (pendingDMs.length > 0) {
-            console.log(`📬 Delivering ${pendingDMs.length} pending DMs to ${username}`);
-            const deliveredIds: number[] = [];
+            console.log(`📬 Delivering ${pendingDMs.length} pending messages to ${username}`);
 
-            for (const dm of pendingDMs) {
+            for (const msg of pendingDMs) {
               ws.send(JSON.stringify({
-                type: "dm",
-                from: dm.username,
-                fromUsername: dm.username,
-                content: dm.content,
-                id: dm.id,
-                created_at: dm.created_at,
-                offline: true // Flag that this was delivered after being offline
+                type: msg.messageType === "text" ? "dm" : "group_message",
+                ...msg,
+                offline: true
               }));
-              deliveredIds.push(dm.id);
+              await messageManager.markDelivered(msg.id);
             }
-
-            // Mark as delivered
-            await markDMsAsDelivered(deliveredIds);
           }
         } catch (err) {
           console.error("Error sending history:", err);
         }
       }
 
-      // LEAVE - Unsubscribe from a room
+      // LEAVE
       else if (data.type === "leave") {
         const roomName = String(data.room || "general");
         leaveRoom(ws, roomName);
         ws.send(JSON.stringify({ type: "left", room: roomName }));
       }
 
-      // MESSAGE - Send message to room
+      // MESSAGE
       else if (data.type === "message") {
         const userData = clientData.get(ws);
-        const username = userData?.username || "Anonymous";
-        const content = String(data.content || "").trim();
-        const roomName = String(data.room || "general");
+        if (!userData) {
+          ws.send(JSON.stringify({ type: "error", message: "Not authenticated. Please join first." }));
+          return;
+        }
+        const username = userData.username;
+        const content = sanitizeInput(String(data.content || "").trim(), 5000);
+        const roomName = sanitizeInput(String(data.room || "general"), 100);
         
-        if (!content) return;
+        if (!content) {
+          ws.send(JSON.stringify({ type: "error", message: "Content required" }));
+          return;
+        }
+        if (!isValidRoomName(roomName)) {
+          ws.send(JSON.stringify({ type: "error", message: "Invalid room name" }));
+          return;
+        }
 
         try {
-          const savedMsg = await saveMessage(username, content, roomName, "room");
+          const savedMsg = await messageManager.saveMessage({
+            senderId: userData?.userId || "",
+            username,
+            content,
+            roomName,
+            messageType: data.mediaType || "text",
+            mediaUrl: data.mediaUrl,
+            mediaType: data.mediaType
+          });
+
           broadcastToRoom(roomName, {
             type: "message",
             ...savedMsg
@@ -478,37 +590,57 @@ const server = Bun.serve({
         }
       }
 
-      // DM - Direct message to a single user
+      // DM
       else if (data.type === "dm") {
         const userData = clientData.get(ws);
         if (!userData) {
-          console.error("❌ DM failed: User not authenticated. Must JOIN first!");
           ws.send(JSON.stringify({ 
             type: "error", 
-            message: "Not authenticated. Please send 'join' message first with username and userId" 
+            message: "Not authenticated" 
           }));
           return;
         }
 
         const username = userData.username;
         const recipientId = String(data.recipientId || "");
-        const content = String(data.content || "").trim();
+        const content = sanitizeInput(String(data.content || "").trim(), 5000);
+
+        // Validate inputs
+        if (!isValidUserId(recipientId)) {
+          ws.send(JSON.stringify({ type: "error", message: "Invalid recipientId format" }));
+          return;
+        }
 
         if (!recipientId || !content) {
           ws.send(JSON.stringify({ type: "error", message: "recipientId and content required" }));
           return;
         }
 
+        // Check if blocked
+        const isBlocked = await userManager.isBlocked(userData.userId, recipientId);
+        if (isBlocked) {
+          ws.send(JSON.stringify({ type: "error", message: "Cannot send message to this user" }));
+          return;
+        }
+
         const recipientSocket = userIdToSocket.get(recipientId);
         
         try {
-          const savedMsg = await saveMessage(username, content, "dm", "dm", recipientId);
+          const savedMsg = await messageManager.saveMessage({
+            senderId: userData.userId,
+            username,
+            content,
+            messageType: data.mediaType || "text",
+            recipientId,
+            mediaUrl: data.mediaUrl,
+            mediaType: data.mediaType,
+            encrypted: data.encrypted || false,
+            encryptionMetadata: data.encryptedContent ? { encryptedContent: data.encryptedContent } : undefined
+          });
           
           if (!recipientSocket) {
-            // User is OFFLINE - save for later delivery
             console.log(`📭 User ${recipientId} is offline. Message saved for later delivery.`);
             
-            // Queue in RabbitMQ if available
             if (useRabbitMQ) {
               await messageQueue.queueOfflineMessage({
                 recipientId,
@@ -524,14 +656,11 @@ const server = Bun.serve({
               type: "dm_sent",
               to: recipientId,
               status: "offline",
-              message: "Message saved. Will be delivered when user comes online.",
-              queueMethod: useRabbitMQ ? "rabbitmq" : "database",
               ...savedMsg
             }));
             return;
           }
 
-          // User is ONLINE - deliver immediately
           recipientSocket.send(JSON.stringify({
             type: "dm",
             from: userData.userId,
@@ -539,10 +668,8 @@ const server = Bun.serve({
             ...savedMsg
           }));
 
-          // Mark as delivered immediately
-          await markDMsAsDelivered([savedMsg.id]);
+          await messageManager.markDelivered(savedMsg.id);
 
-          // Confirm to sender
           ws.send(JSON.stringify({
             type: "dm_sent",
             to: recipientId,
@@ -557,91 +684,56 @@ const server = Bun.serve({
         }
       }
 
-      // GROUP_MESSAGE - Send to multiple specific users
-      else if (data.type === "group_message") {
+      // MESSAGE_SEEN - Read receipt
+      else if (data.type === "message_seen") {
         const userData = clientData.get(ws);
-        if (!userData) {
-          console.error("❌ Group message failed: User not authenticated. Must JOIN first!");
-          ws.send(JSON.stringify({ 
-            type: "error", 
-            message: "Not authenticated. Please send 'join' message first with username and userId" 
-          }));
-          return;
-        }
+        if (!userData) return;
 
-        const username = userData.username;
-        const recipientIds: string[] = data.recipientIds || [];
-        const content = String(data.content || "").trim();
-        const groupName = String(data.groupName || "private-group");
-
-        if (recipientIds.length === 0 || !content) {
-          ws.send(JSON.stringify({ type: "error", message: "recipientIds and content required" }));
-          return;
-        }
+        const messageId = data.messageId;
+        if (!messageId) return;
 
         try {
-          const savedMsg = await saveMessage(username, content, groupName, "group", recipientIds.join(","));
+          await messageManager.markSeen(messageId, userData.userId);
           
-          let sentCount = 0;
-          const failedRecipients: string[] = [];
-          const offlineRecipients: string[] = [];
-
-          // Send to each recipient
-          for (const recipientId of recipientIds) {
-            const recipientSocket = userIdToSocket.get(recipientId);
-            if (recipientSocket) {
-              // User is ONLINE - deliver immediately
-              recipientSocket.send(JSON.stringify({
-                type: "group_message",
-                from: userData.userId,
-                fromUsername: username,
-                groupName,
-                recipientIds,
-                ...savedMsg
-              }));
-              sentCount++;
-            } else {
-              // User is OFFLINE - queue for later
-              offlineRecipients.push(recipientId);
-              
-              if (useRabbitMQ) {
-                await messageQueue.queueOfflineMessage({
-                  recipientId,
-                  from: userData.userId,
-                  fromUsername: username,
-                  content,
-                  messageType: 'group',
-                  messageId: savedMsg.id,
-                  groupName,
-                  recipientIds
-                });
-              }
-              
-              console.log(`📭 User ${recipientId} offline. Message queued.`);
-            }
-          }
-
-          // Confirm to sender
-          ws.send(JSON.stringify({
-            type: "group_message_sent",
-            groupName,
-            recipientIds,
-            sentCount,
-            offlineCount: offlineRecipients.length,
-            offlineRecipients,
-            failedRecipients,
-            queueMethod: useRabbitMQ ? "rabbitmq" : "database",
-            ...savedMsg
-          }));
-
-          console.log(`👥 Group message from ${username}: ${sentCount} delivered, ${offlineRecipients.length} queued`);
+          // Get receipts to find sender
+          const receipts = await messageManager.getReadReceipts(messageId);
+          console.log(`✅ Message ${messageId} marked as seen by ${userData.userId}`);
         } catch (err) {
-          console.error("❌ Error sending group message:", err);
-          ws.send(JSON.stringify({ type: "error", message: "Failed to send group message" }));
+          console.error("❌ Error marking message as seen:", err);
         }
       }
 
-      // TYPING - Typing indicator
+      // STAR_MESSAGE
+      else if (data.type === "star_message") {
+        const userData = clientData.get(ws);
+        if (!userData) return;
+
+        try {
+          await messageManager.toggleStar(data.messageId, userData.userId);
+          ws.send(JSON.stringify({ type: "message_starred", messageId: data.messageId }));
+        } catch (err) {
+          console.error("❌ Error starring message:", err);
+        }
+      }
+
+      // PIN_MESSAGE
+      else if (data.type === "pin_message") {
+        const userData = clientData.get(ws);
+        if (!userData) return;
+
+        try {
+          await messageManager.togglePin(data.messageId, data.roomName);
+          broadcastToRoom(data.roomName, {
+            type: "message_pinned",
+            messageId: data.messageId,
+            pinnedBy: userData.username
+          });
+        } catch (err) {
+          console.error("❌ Error pinning message:", err);
+        }
+      }
+
+      // TYPING
       else if (data.type === "typing") {
         const userData = clientData.get(ws);
         if (!userData) return;
@@ -652,17 +744,184 @@ const server = Bun.serve({
         setTyping(roomName, userData.username, isTyping);
       }
 
-      // GET_ROOMS - Request room list
+      // GET_ROOMS
       else if (data.type === "get_rooms") {
         const roomList = await getRoomList();
         ws.send(JSON.stringify({ type: "room_list", rooms: roomList }));
       }
 
-      // GET_USERS - Request users in a room
+      // GET_USERS
       else if (data.type === "get_users") {
         const roomName = String(data.room || "general");
         const users = await getOnlineUsers(roomName);
         ws.send(JSON.stringify({ type: "user_list", room: roomName, users }));
+      }
+
+      // INIT_KEYS - Initialize Signal Protocol keys
+      else if (data.type === "init_keys") {
+        const userData = clientData.get(ws);
+        if (!userData) return;
+
+        try {
+          const keys = await signalManager.initializeUser(userData.userId);
+          ws.send(JSON.stringify({
+            type: "keys_initialized",
+            ...keys
+          }));
+          console.log(`✅ Keys initialized for ${userData.username}`);
+        } catch (err) {
+          console.error("❌ Error initializing keys:", err);
+          ws.send(JSON.stringify({ type: "error", message: "Failed to initialize keys" }));
+        }
+      }
+
+      // GET_BUNDLE - Get recipient's pre-key bundle
+      else if (data.type === "get_bundle") {
+        const userData = clientData.get(ws);
+        if (!userData) return;
+
+        try {
+          const recipientId = data.recipientId;
+          const bundle = await signalManager.getUserPreKeyBundle(recipientId);
+          
+          if (!bundle) {
+            ws.send(JSON.stringify({ 
+              type: "error", 
+              message: "Recipient has not initialized encryption keys" 
+            }));
+            return;
+          }
+
+          ws.send(JSON.stringify({
+            type: "bundle_received",
+            recipientId,
+            bundle
+          }));
+        } catch (err) {
+          console.error("❌ Error getting bundle:", err);
+          ws.send(JSON.stringify({ type: "error", message: "Failed to get pre-key bundle" }));
+        }
+      }
+
+      // ENCRYPTED_DM - Send encrypted direct message
+      else if (data.type === "encrypted_dm") {
+        const userData = clientData.get(ws);
+        if (!userData) {
+          ws.send(JSON.stringify({ 
+            type: "error", 
+            message: "Not authenticated" 
+          }));
+          return;
+        }
+
+        const recipientId = String(data.recipientId || "");
+        const message = String(data.message || "");
+
+        if (!recipientId || !message) {
+          ws.send(JSON.stringify({ type: "error", message: "recipientId and message required" }));
+          return;
+        }
+
+        try {
+          // Encrypt the message
+          const encrypted = await signalManager.encryptMessage(
+            userData.userId,
+            recipientId,
+            message
+          );
+
+          // Save encrypted message
+          const savedMsg = await messageManager.saveMessage({
+            senderId: userData.userId,
+            username: userData.username,
+            content: "[Encrypted]",
+            messageType: "text",
+            recipientId,
+            encrypted: true,
+            encryptionMetadata: encrypted
+          });
+
+          const recipientSocket = userIdToSocket.get(recipientId);
+          
+          if (!recipientSocket) {
+            console.log(`📭 User ${recipientId} is offline. Encrypted message saved.`);
+            
+            if (useRabbitMQ) {
+              await messageQueue.queueOfflineMessage({
+                recipientId,
+                from: userData.userId,
+                fromUsername: userData.username,
+                content: "[Encrypted]",
+                messageType: 'dm',
+                messageId: savedMsg.id
+              });
+            }
+            
+            ws.send(JSON.stringify({
+              type: "encrypted_dm_sent",
+              to: recipientId,
+              status: "offline",
+              messageId: savedMsg.id
+            }));
+            return;
+          }
+
+          // Deliver encrypted message
+          recipientSocket.send(JSON.stringify({
+            type: "encrypted_dm",
+            from: userData.userId,
+            fromUsername: userData.username,
+            messageId: savedMsg.id,
+            encrypted: encrypted,
+            created_at: savedMsg.createdAt
+          }));
+
+          await messageManager.markDelivered(savedMsg.id);
+
+          ws.send(JSON.stringify({
+            type: "encrypted_dm_sent",
+            to: recipientId,
+            status: "delivered",
+            messageId: savedMsg.id
+          }));
+
+          console.log(`🔐 Encrypted DM from ${userData.username} to ${recipientId}`);
+        } catch (err) {
+          console.error("❌ Error sending encrypted DM:", err);
+          ws.send(JSON.stringify({ 
+            type: "error", 
+            message: `Failed to send encrypted message: ${err}` 
+          }));
+        }
+      }
+
+      // DECRYPT_MESSAGE - Decrypt received message (client-side should handle this)
+      else if (data.type === "decrypt_message") {
+        const userData = clientData.get(ws);
+        if (!userData) return;
+
+        try {
+          const senderId = data.senderId;
+          const encrypted = data.encrypted;
+
+          const decrypted = await signalManager.decryptMessage(
+            userData.userId,
+            senderId,
+            encrypted
+          );
+
+          ws.send(JSON.stringify({
+            type: "message_decrypted",
+            messageId: data.messageId,
+            decrypted
+          }));
+        } catch (err) {
+          console.error("❌ Error decrypting message:", err);
+          ws.send(JSON.stringify({ 
+            type: "error", 
+            message: "Failed to decrypt message" 
+          }));
+        }
       }
     },
 
@@ -676,24 +935,18 @@ const server = Bun.serve({
         }
       }
 
-      // Remove from DM registry
       if (userData) {
         userIdToSocket.delete(userData.userId);
       }
 
       console.log(`🔌 Disconnected: ${userData?.username || "Unknown"}`);
-    },
-
-    error(ws, err) {
-      console.error("❌ WS error:", err);
     }
   },
 });
 
-// Test database and RabbitMQ before starting
+// Initialize
 await testDatabase();
 
-// Initialize RabbitMQ (optional - falls back to database if unavailable)
 const mqInstance = await initMessageQueue();
 useRabbitMQ = mqInstance !== null;
 
@@ -704,24 +957,19 @@ if (useRabbitMQ) {
 }
 
 console.log(`
-🚀 Bun Chat Server with Pub/Sub System
+🚀 Enhanced Chat Server with E2E Encryption
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📡 WebSocket: ws://localhost:${server.port}/chat
+📤 Upload: http://localhost:${server.port}/upload
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-REST API Endpoints:
-  📋 GET  /rooms                  - List all rooms
-  📋 GET  /messages?room=general  - Get room messages
-  📨 POST /message                - Send message
-  👥 GET  /users?room=general     - Get online users
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-WebSocket Events:
-  📥 join           - Join a room
-  📥 leave          - Leave a room
-  📥 message        - Send to room
-  📥 dm             - Direct message (1-to-1)
-  📥 group_message  - Group message (1-to-many)
-  📥 typing         - Typing indicator
-  📥 get_rooms      - Request room list
-  📥 get_users      - Request user list
+Features:
+  ✅ Text, Emoji, Stickers, GIFs
+  ✅ Media (Images, Videos, Docs, Voice)
+  ✅ E2E Encryption (Signal Protocol)
+  ✅ Read Receipts & Typing Indicators
+  ✅ Star/Pin Messages
+  ✅ Block/Report Users
+  ✅ Message Search
+  ✅ Offline Message Queue
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 `);
