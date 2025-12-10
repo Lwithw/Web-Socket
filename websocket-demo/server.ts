@@ -9,6 +9,7 @@ import { messageManager } from "./messages";
 import { authenticateRequest, authenticateWebSocket, generateToken } from "./auth";
 import { rateLimitMiddleware, rateLimitWebSocket } from "./rate-limit";
 import { getSecurityHeaders, sanitizeInput, isValidUserId, isValidRoomName, isValidUsername, handleCorsPreflight, getSslOptions } from "./security";
+import { initRedis, onRedisMessage, publishBroadcast, publishSignal, redisEnabled } from "./redis";
 
 // Room-based pub/sub system
 type Room = {
@@ -76,7 +77,7 @@ function leaveRoom(ws: ServerWebSocket, roomName: string) {
   }
 }
 
-function broadcastToRoom(roomName: string, data: any, exclude?: ServerWebSocket) {
+function broadcastToRoom(roomName: string, data: any, exclude?: ServerWebSocket, fromRedis: boolean = false) {
   const room = rooms.get(roomName);
   if (!room) return;
 
@@ -94,6 +95,10 @@ function broadcastToRoom(roomName: string, data: any, exclude?: ServerWebSocket)
   }
 
   console.log(`📡 Broadcast to room ${roomName}: ${sent}/${room.clients.size} clients`);
+
+  if (redisEnabled && !fromRedis) {
+    publishBroadcast(roomName, data);
+  }
 }
 
 async function getOnlineUsers(roomName: string): Promise<string[]> {
@@ -684,6 +689,50 @@ const server = Bun.serve({
         }
       }
 
+      // WEBRTC SIGNAL FORWARDING
+      else if (data.type === "signal") {
+        const userData = clientData.get(ws);
+        if (!userData) {
+          ws.send(JSON.stringify({ type: "error", message: "Not authenticated" }));
+          return;
+        }
+
+        const to = String(data.to || "");
+        const payload = data.payload;
+
+        if (!isValidUserId(to)) {
+          ws.send(JSON.stringify({ type: "error", message: "Invalid recipientId format" }));
+          return;
+        }
+        if (!payload || typeof payload !== "object") {
+          ws.send(JSON.stringify({ type: "error", message: "Missing signal payload" }));
+          return;
+        }
+
+        const recipientSocket = userIdToSocket.get(to);
+        if (!recipientSocket) {
+          if (redisEnabled) {
+            publishSignal(to, payload);
+            ws.send(JSON.stringify({ type: "signal_sent", to, ok: true, via: "redis" }));
+          } else {
+            ws.send(JSON.stringify({ type: "error", message: "Recipient not connected" }));
+          }
+          return;
+        }
+
+        try {
+          recipientSocket.send(JSON.stringify({
+            type: "signal",
+            from: userData.userId,
+            payload
+          }));
+          ws.send(JSON.stringify({ type: "signal_sent", to, ok: true }));
+        } catch (err) {
+          console.error("❌ Error forwarding signal:", err);
+          ws.send(JSON.stringify({ type: "error", message: "Failed to forward signal" }));
+        }
+      }
+
       // MESSAGE_SEEN - Read receipt
       else if (data.type === "message_seen") {
         const userData = clientData.get(ws);
@@ -946,6 +995,27 @@ const server = Bun.serve({
 
 // Initialize
 await testDatabase();
+
+const redisStarted = await initRedis();
+if (redisStarted) {
+  console.log("✅ Redis enabled for WebSocket pub/sub");
+  onRedisMessage((msg) => {
+    if (msg.type === "broadcast") {
+      broadcastToRoom(msg.room, msg.data, undefined, true);
+    } else if (msg.type === "signal") {
+      const recipientSocket = userIdToSocket.get(msg.to);
+      if (recipientSocket) {
+        recipientSocket.send(JSON.stringify({
+          type: "signal",
+          from: msg.from,
+          payload: msg.payload
+        }));
+      }
+    }
+  });
+} else {
+  console.log("ℹ️ Redis not configured; running single-instance WebSocket handling");
+}
 
 const mqInstance = await initMessageQueue();
 useRabbitMQ = mqInstance !== null;

@@ -20,7 +20,7 @@
   </style>
 </head>
 <body>
-  <h2>Chat Test Client</h2>
+  <h2>Chat + WebRTC Test Client</h2>
 
   <fieldset>
     <legend>Auth (HTTP)</legend>
@@ -77,6 +77,30 @@
     </div>
   </fieldset>
 
+  <fieldset>
+    <legend>WebRTC Call (WhatsApp-style)</legend>
+    <div class="row">
+      <label>Peer User ID</label><input id="peerId" placeholder="other user id" />
+      <button id="callBtn" disabled>Start Call</button>
+      <button id="hangupBtn" disabled>Hang Up</button>
+    </div>
+    <div class="row">
+      <button id="muteBtn" disabled>Mute Audio</button>
+      <button id="cameraBtn" disabled>Toggle Camera</button>
+      <button id="shareBtn" disabled>Share Screen</button>
+    </div>
+    <div class="row" style="gap:16px">
+      <div>
+        <div>Local</div>
+        <video id="localVideo" autoplay playsinline muted style="width:320px;height:240px;background:#000"></video>
+      </div>
+      <div>
+        <div>Remote</div>
+        <video id="remoteVideo" autoplay playsinline style="width:320px;height:240px;background:#000"></video>
+      </div>
+    </div>
+  </fieldset>
+
   <div id="log"></div>
 
   <script>
@@ -94,6 +118,9 @@
     const messageIdEl = qs("messageId");
     const pinRoomEl = qs("pinRoom");
     const logEl = qs("log");
+    const peerIdEl = qs("peerId");
+    const localVideo = qs("localVideo");
+    const remoteVideo = qs("remoteVideo");
 
     const btn = {
       login: qs("loginBtn"),
@@ -110,12 +137,33 @@
       pin: qs("pinBtn"),
       getRooms: qs("getRoomsBtn"),
       getUsers: qs("getUsersBtn"),
+      call: qs("callBtn"),
+      hangup: qs("hangupBtn"),
+      mute: qs("muteBtn"),
+      camera: qs("cameraBtn"),
+      share: qs("shareBtn"),
     };
 
     let ws = null;
     let connected = false;
     let joined = false;
     let typingOn = false;
+    let pc = null;
+    let localStream = null;
+    let cameraStream = null;
+    let screenStream = null;
+    let audioMuted = false;
+    let cameraOff = false;
+    let usingScreen = false;
+    let localVideoSender = null;
+
+    const rtcConfig = {
+      iceServers: [
+        { urls: "stun:stun.l.google.com:19302" },
+        // TURN example so it works across NAT/firewall
+        { urls: "turn:turn.example.com:3478", username: "demo", credential: "demo" },
+      ],
+    };
 
     function log(msg, type = "system") {
       const div = document.createElement("div");
@@ -139,7 +187,187 @@
       btn.pin.disabled = !joined;
       btn.getRooms.disabled = !connected;
       btn.getUsers.disabled = !joined;
+      const webrtcReady = connected && joined && localStream;
+      btn.call.disabled = !webrtcReady || !!pc;
+      btn.hangup.disabled = !pc;
+      btn.mute.disabled = !pc;
+      btn.camera.disabled = !pc;
+      btn.share.disabled = !pc;
     }
+
+    async function initMedia() {
+      try {
+        cameraStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        localStream = cameraStream;
+        attachLocal(localStream);
+        log("Camera + mic started", "msg");
+        setState();
+      } catch (e) {
+        log("Media error: " + e.message, "error");
+      }
+    }
+
+    function attachLocal(stream) {
+      localVideo.srcObject = stream;
+    }
+
+    function ensurePeerConnection() {
+      if (pc) return pc;
+      pc = new RTCPeerConnection(rtcConfig);
+      pc.onicecandidate = (evt) => {
+        if (evt.candidate) {
+          sendSignal({ type: "ice", candidate: evt.candidate });
+        }
+      };
+      pc.ontrack = (evt) => {
+        remoteVideo.srcObject = evt.streams[0];
+      };
+      pc.onconnectionstatechange = () => {
+        if (["failed", "disconnected", "closed"].includes(pc.connectionState)) {
+          log("Peer connection ended: " + pc.connectionState, "error");
+          endCall();
+        }
+      };
+      localStream.getTracks().forEach((t) => {
+        const sender = pc.addTrack(t, localStream);
+        if (t.kind === "video") localVideoSender = sender;
+      });
+      return pc;
+    }
+
+    function sendSignal(payload) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const to = peerIdEl.value.trim();
+      const from = userIdEl.value.trim() || `user-${Date.now()}`;
+      ws.send(JSON.stringify({ type: "signal", to, from, payload }));
+      log("sent signal: " + payload.type, "msg");
+    }
+
+    async function startCall() {
+      const target = peerIdEl.value.trim();
+      if (!target) {
+        log("Peer User ID required", "error");
+        return;
+      }
+      const pcLocal = ensurePeerConnection();
+      const offer = await pcLocal.createOffer();
+      await pcLocal.setLocalDescription(offer);
+      sendSignal({ type: "offer", sdp: offer });
+      setState();
+    }
+
+    async function handleSignal(msg) {
+      if (!msg || !msg.payload) return;
+      const { type, sdp, candidate } = msg.payload;
+      switch (type) {
+        case "offer": {
+          ensurePeerConnection();
+          await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          sendSignal({ type: "answer", sdp: answer });
+          break;
+        }
+        case "answer": {
+          if (!pc) return;
+          await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+          break;
+        }
+        case "ice": {
+          if (pc && candidate) {
+            try {
+              await pc.addIceCandidate(new RTCIceCandidate(candidate));
+            } catch (e) {
+              log("ICE add error: " + e.message, "error");
+            }
+          }
+          break;
+        }
+        default:
+          break;
+      }
+      setState();
+    }
+
+    function endCall() {
+      if (pc) {
+        pc.close();
+      }
+      pc = null;
+      localVideoSender = null;
+      stopScreenShare();
+      if (cameraStream) {
+        cameraStream.getTracks().forEach((t) => (t.enabled = true));
+        localStream = cameraStream;
+        attachLocal(localStream);
+      }
+      audioMuted = false;
+      cameraOff = false;
+      usingScreen = false;
+      setState();
+      log("Call ended", "msg");
+    }
+
+    function toggleMute() {
+      if (!localStream) return;
+      localStream.getAudioTracks().forEach((t) => (t.enabled = audioMuted));
+      audioMuted = !audioMuted;
+      log(audioMuted ? "Audio muted" : "Audio unmuted", "msg");
+    }
+
+    function toggleCamera() {
+      if (!localStream) return;
+      localStream.getVideoTracks().forEach((t) => (t.enabled = cameraOff));
+      cameraOff = !cameraOff;
+      log(cameraOff ? "Camera off" : "Camera on", "msg");
+    }
+
+    async function startScreenShare() {
+      if (!localVideoSender) {
+        log("No video sender to replace", "error");
+        return;
+      }
+      try {
+        screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+        const screenTrack = screenStream.getVideoTracks()[0];
+        screenTrack.onended = stopScreenShare;
+        await localVideoSender.replaceTrack(screenTrack);
+        usingScreen = true;
+        localStream = new MediaStream([screenTrack, ...cameraStream.getAudioTracks()]);
+        attachLocal(localStream);
+        log("Screen sharing started", "msg");
+      } catch (e) {
+        log("Screen share error: " + e.message, "error");
+      }
+      setState();
+    }
+
+    async function stopScreenShare() {
+      if (!usingScreen || !localVideoSender) return;
+      const camTrack = cameraStream.getVideoTracks()[0];
+      await localVideoSender.replaceTrack(camTrack);
+      if (screenStream) {
+        screenStream.getTracks().forEach((t) => t.stop());
+        screenStream = null;
+      }
+      localStream = cameraStream;
+      attachLocal(localStream);
+      usingScreen = false;
+      log("Returned to camera", "msg");
+      setState();
+    }
+
+    btn.call.onclick = startCall;
+    btn.hangup.onclick = endCall;
+    btn.mute.onclick = toggleMute;
+    btn.camera.onclick = toggleCamera;
+    btn.share.onclick = () => {
+      if (usingScreen) {
+        stopScreenShare();
+      } else {
+        startScreenShare();
+      }
+    };
 
     btn.login.onclick = async () => {
       try {
@@ -177,6 +405,14 @@
 
       ws.onmessage = (evt) => {
         log(`recv: ${evt.data}`, "msg");
+        try {
+          const msg = JSON.parse(evt.data);
+          if (msg.type === "signal" && msg.payload) {
+            handleSignal(msg);
+          }
+        } catch (_) {
+          // not JSON or not signal; ignore
+        }
       };
 
       ws.onclose = () => {
@@ -298,6 +534,7 @@
     };
 
     setState();
+    initMedia();
   </script>
 </body>
 </html>

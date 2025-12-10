@@ -11,6 +11,7 @@
     "@signalapp/libsignal-client": "^0.86.7",
     "@types/mime-types": "^2.1.4",
     "amqplib": "^0.10.9",
+    "ioredis": "^5.8.2",
     "jsonwebtoken": "^9.0.2",
     "mime-types": "^2.1.35",
     "pg": "^8.16.3",
