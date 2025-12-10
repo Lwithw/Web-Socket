@@ -5,6 +5,7 @@
 - Bun runtime (v1.3.4+)
 - PostgreSQL database
 - (Optional) RabbitMQ for message queuing
+- (Optional) Redis for WebSocket pub/sub across instances
 
 ## Installation
 
@@ -33,6 +34,8 @@ DB_PORT=5432
 DB_NAME=bun_chat
 JWT_SECRET=your_super_secret_jwt_key_minimum_32_characters
 PORT=3000
+# Optional
+REDIS_URL=redis://localhost:6379
 ```
 
 5. **Run the server:**
