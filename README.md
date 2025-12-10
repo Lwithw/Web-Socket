@@ -9,6 +9,13 @@ A feature-rich WebSocket chat server built with Bun, featuring end-to-end encryp
 bun install
 ```
 
+2. **Run with Docker Compose (app + Redis + RabbitMQ):**
+```bash
+docker compose up --build
+```
+- Configure `.env` with `REDIS_URL=redis://redis:6379` and `RABBITMQ_URL=amqp://rabbitmq:5672`.
+- RabbitMQ UI: http://localhost:15672 (guest/guest). Redis exposed on 6379.
+
 2. **Set up environment variables:**
    - Create a `.env` file (see [SECURITY.md](./SECURITY.md) for configuration)
    - Configure database credentials and JWT secret
@@ -32,6 +39,7 @@ bun run server.ts
 ## Features
 
 - ✅ Real-time messaging (1-on-1, group, broadcast)
+- ✅ Optional Redis pub/sub for WebSocket scaling
 - ✅ End-to-end encryption (Signal Protocol)
 - ✅ Media sharing (images, videos, documents, voice)
 - ✅ Read receipts & typing indicators
@@ -75,6 +83,7 @@ Client → Server:
 - `pin_message` — `{ type, messageId, roomName }`
 - `get_rooms` — `{ type }`
 - `get_users` — `{ type, room }`
+- `signal` — `{ type, to, from, payload }` (forwarded for WebRTC offer/answer/ICE)
 - Encryption: `init_keys`, `get_bundle`, `encrypted_dm`, `decrypt_message`
 
 Server → Client:
@@ -112,6 +121,7 @@ This project includes production-ready security features:
 - **Runtime:** Bun v1.3.4+
 - **Database:** PostgreSQL
 - **Message Queue:** RabbitMQ (optional)
+- **Pub/Sub:** Redis (optional, for multi-instance WebSocket)
 - **Encryption:** Signal Protocol
 - **Language:** TypeScript
 
